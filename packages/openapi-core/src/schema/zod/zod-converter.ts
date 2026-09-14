@@ -11,7 +11,7 @@ import { traverse } from "../../shared/babel-traverse.js";
 import { extractInternalFlagFromComments } from "../../shared/jsdoc.js";
 import { logger } from "../../shared/logger.js";
 import { parseTypeScriptFile } from "../../shared/parse-typescript.js";
-import { SymbolResolver } from "../../shared/symbol-resolver.js";
+import { type ResolvedLiteral, SymbolResolver } from "../../shared/symbol-resolver.js";
 import type { ContentType, Diagnostic, OpenApiSchema } from "../../shared/types.js";
 import {
   expandFactoryCall,
@@ -1407,8 +1407,8 @@ export class ZodSchemaConverter {
 
   /**
    * Resolve a numeric value from a call-expression argument.
-   * Handles: numeric literals, identifier references to const numbers,
-   * and `x as number` / `x satisfies number` wrappers around either.
+   * Handles: numeric literals, identifier references to const numbers (including
+   * imported ones), arithmetic on literals, and `as` / `satisfies` wrappers.
    */
   private resolveNumericArg(arg: t.Node | null | undefined): number | undefined {
     if (!arg) return undefined;
@@ -1417,27 +1417,54 @@ export class ZodSchemaConverter {
     if (t.isUnaryExpression(node) && node.operator === "-" && t.isNumericLiteral(node.argument)) {
       return -node.argument.value;
     }
-    if (t.isIdentifier(node)) {
-      const val = this.resolveLiteralValue(node.name);
-      if (typeof val === "number") return val;
-    }
-    return undefined;
+    const value = this.evaluateStaticExpression(node);
+    return typeof value === "number" ? value : undefined;
   }
 
   /**
    * Resolve a string value from a call-expression argument.
-   * Handles: string literals, identifier references to const strings,
-   * and `x as string` / `x satisfies string` wrappers around either.
+   * Handles: string literals, identifier references to const strings (including
+   * imported ones), template literals whose expressions all resolve, and
+   * `as` / `satisfies` wrappers.
    */
   private resolveStringArg(arg: t.Node | null | undefined): string | undefined {
     if (!arg) return undefined;
     const node = this.unwrapTypeAssertion(arg);
     if (t.isStringLiteral(node)) return node.value;
-    if (t.isIdentifier(node)) {
-      const val = this.resolveLiteralValue(node.name);
-      if (typeof val === "string") return val;
+    const value = this.evaluateStaticExpression(node);
+    return typeof value === "string" ? value : undefined;
+  }
+
+  /** Statically evaluate an argument expression against the file being converted. */
+  private evaluateStaticExpression(node: t.Node | null | undefined): ResolvedLiteral | undefined {
+    if (!node) return undefined;
+    if (this.currentFilePath && this.currentAST) {
+      this.symbolResolver.primeAST(this.currentFilePath, this.currentAST);
     }
-    return undefined;
+    return this.symbolResolver.evaluateExpression(this.currentFilePath, node);
+  }
+
+  /** Report a Zod check whose argument could not be reduced to a value. */
+  private reportUnresolvedArgument(methodName: string, arg: t.Node | null | undefined): void {
+    if (!arg || !this.diagnostics) return;
+
+    const node = this.unwrapTypeAssertion(arg) ?? arg;
+    const source = namedIdentifiers(node);
+    const key = `unresolved-zod-argument:${this.currentFilePath ?? ""}:${methodName}:${source ?? ""}`;
+    if (this.emittedUnknownDiagnostics.has(key)) return;
+    this.emittedUnknownDiagnostics.add(key);
+
+    this.diagnostics.add({
+      code: "unresolved-zod-argument",
+      severity: "warning",
+      message: `Could not statically resolve the argument of ".${methodName}(${source ?? "..."})"; the constraint is missing from the generated schema.`,
+      ...(this.currentFilePath ? { filePath: this.currentFilePath } : {}),
+      metadata: {
+        method: methodName,
+        ...(source ? { name: source } : {}),
+        ...(node.loc ? { line: node.loc.start.line } : {}),
+      },
+    });
   }
 
   private resolveStringArrayArg(arg: t.Node | null | undefined): string[] | undefined {
@@ -1548,12 +1575,12 @@ export class ZodSchemaConverter {
     if (t.isNullLiteral(node)) {
       return null;
     }
-    if (t.isIdentifier(node)) {
-      const val = this.resolveLiteralValue(node.name);
-      if (val !== undefined) return val;
-    }
     if (t.isTSAsExpression(node) || t.isTSSatisfiesExpression(node)) {
       return this.extractStaticJsonValue(node.expression);
+    }
+    if (t.isIdentifier(node) || t.isTemplateLiteral(node) || t.isBinaryExpression(node)) {
+      const value = this.evaluateStaticExpression(node);
+      if (value !== undefined) return value;
     }
     if (t.isArrayExpression(node)) {
       const values: unknown[] = [];
@@ -2305,4 +2332,14 @@ function getZodRuntimeHelperPath(
   }
 
   return currentObject.name === "z" || currentObject.name === zodLocalName ? path : null;
+}
+
+/** Symbols the author can act on, or `null` when the argument names none. */
+function namedIdentifiers(node: t.Node): string | null {
+  if (t.isIdentifier(node)) return node.name;
+  if (t.isTemplateLiteral(node)) {
+    const names = node.expressions.filter((expression) => t.isIdentifier(expression));
+    return names.length > 0 ? names.map((expression) => expression.name).join(", ") : null;
+  }
+  return null;
 }

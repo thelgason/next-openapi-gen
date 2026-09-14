@@ -23,6 +23,7 @@ export type ZodChainHost = {
   mergeExtendedObject: (base: OpenApiSchema, arg: t.Node | undefined) => OpenApiSchema;
   mergePipeSchema: (schema: OpenApiSchema, piped: OpenApiSchema) => OpenApiSchema;
   processZodNode: (node: t.Node) => OpenApiSchema;
+  reportUnresolvedArgument: (methodName: string, argument: t.Node | undefined) => void;
   resolveLiteralValue: (name: string) => unknown;
   resolveNumericArg: (node: t.Node | undefined) => number | undefined;
   resolveStringArg: (node: t.Node | undefined) => string | undefined;
@@ -30,6 +31,21 @@ export type ZodChainHost = {
   unwrapTypeAssertion: (node: t.Node | undefined) => t.Node;
   warnIfUnknownZodMethod: (methodName: string) => void;
 };
+
+// Every check that reads a value from source goes through here so nothing is dropped silently.
+function reportUnresolved<TValue>(
+  converter: ZodChainHost,
+  methodName: string,
+  node: t.CallExpression,
+  resolve: () => TValue | undefined,
+): TValue | undefined {
+  const value = resolve();
+  const argument = node.arguments[0];
+  if (value === undefined && argument) {
+    converter.reportUnresolvedArgument(methodName, argument);
+  }
+  return value;
+}
 
 export function applyZodChainMethod(
   converter: ZodChainHost,
@@ -51,7 +67,9 @@ export function applyZodChainMethod(
       schema = applyNullableWrapper(schema);
       break;
     case "describe": {
-      const descVal = converter.resolveStringArg(node.arguments[0]);
+      const descVal = reportUnresolved(converter, "describe", node, () =>
+        converter.resolveStringArg(node.arguments[0]),
+      );
       if (descVal !== undefined) {
         // Check if description includes @deprecated
         if (descVal.startsWith("@deprecated")) {
@@ -68,7 +86,9 @@ export function applyZodChainMethod(
       schema.deprecated = true;
       break;
     case "min": {
-      const minVal = converter.resolveNumericArg(node.arguments[0]);
+      const minVal = reportUnresolved(converter, "min", node, () =>
+        converter.resolveNumericArg(node.arguments[0]),
+      );
       if (minVal !== undefined) {
         if (schema.type === "string") {
           schema.minLength = minVal;
@@ -81,7 +101,9 @@ export function applyZodChainMethod(
       break;
     }
     case "max": {
-      const maxVal = converter.resolveNumericArg(node.arguments[0]);
+      const maxVal = reportUnresolved(converter, "max", node, () =>
+        converter.resolveNumericArg(node.arguments[0]),
+      );
       if (maxVal !== undefined) {
         if (schema.type === "string") {
           schema.maxLength = maxVal;
@@ -94,7 +116,9 @@ export function applyZodChainMethod(
       break;
     }
     case "length": {
-      const lenVal = converter.resolveNumericArg(node.arguments[0]);
+      const lenVal = reportUnresolved(converter, "length", node, () =>
+        converter.resolveNumericArg(node.arguments[0]),
+      );
       if (lenVal !== undefined) {
         if (schema.type === "string") {
           schema.minLength = lenVal;
@@ -184,21 +208,27 @@ export function applyZodChainMethod(
       }
       break;
     case "startsWith": {
-      const swVal = converter.resolveStringArg(node.arguments[0]);
+      const swVal = reportUnresolved(converter, "startsWith", node, () =>
+        converter.resolveStringArg(node.arguments[0]),
+      );
       if (swVal !== undefined) {
         schema.pattern = `^${converter.escapeRegExp(swVal)}`;
       }
       break;
     }
     case "endsWith": {
-      const ewVal = converter.resolveStringArg(node.arguments[0]);
+      const ewVal = reportUnresolved(converter, "endsWith", node, () =>
+        converter.resolveStringArg(node.arguments[0]),
+      );
       if (ewVal !== undefined) {
         schema.pattern = `${converter.escapeRegExp(ewVal)}$`;
       }
       break;
     }
     case "includes": {
-      const incVal = converter.resolveStringArg(node.arguments[0]);
+      const incVal = reportUnresolved(converter, "includes", node, () =>
+        converter.resolveStringArg(node.arguments[0]),
+      );
       if (incVal !== undefined) {
         schema.pattern = converter.escapeRegExp(incVal);
       }
@@ -211,7 +241,9 @@ export function applyZodChainMethod(
       break;
     case "multipleOf":
     case "step": {
-      const multipleOf = converter.resolveNumericArg(node.arguments[0]);
+      const multipleOf = reportUnresolved(converter, methodName, node, () =>
+        converter.resolveNumericArg(node.arguments[0]),
+      );
       if (multipleOf !== undefined) {
         schema.multipleOf = multipleOf;
       }
@@ -254,14 +286,18 @@ export function applyZodChainMethod(
       break;
     }
     case "minSize": {
-      const minSize = converter.resolveNumericArg(node.arguments[0]);
+      const minSize = reportUnresolved(converter, "minSize", node, () =>
+        converter.resolveNumericArg(node.arguments[0]),
+      );
       if (minSize !== undefined) {
         schema.minLength = minSize;
       }
       break;
     }
     case "maxSize": {
-      const maxSize = converter.resolveNumericArg(node.arguments[0]);
+      const maxSize = reportUnresolved(converter, "maxSize", node, () =>
+        converter.resolveNumericArg(node.arguments[0]),
+      );
       if (maxSize !== undefined) {
         schema.maxLength = maxSize;
       }
@@ -322,7 +358,9 @@ export function applyZodChainMethod(
       break;
     case "meta":
       if (node.arguments.length > 0) {
-        const metadata = converter.extractStaticJsonValue(node.arguments[0]);
+        const metadata = reportUnresolved(converter, "meta", node, () =>
+          converter.extractStaticJsonValue(node.arguments[0]),
+        );
         if (metadata && typeof metadata === "object" && !Array.isArray(metadata)) {
           const {
             id: _id,
