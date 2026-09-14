@@ -13,6 +13,7 @@ export type FileSymbolIndex = {
   constObjects: Map<string, t.ObjectExpression>;
   constArrays: Map<string, t.ArrayExpression>;
   constLiterals: Map<string, t.Literal>;
+  constExpressions: Map<string, t.Expression>;
   typeAliases: Map<string, t.TSTypeAliasDeclaration>;
   /**
    * Multiple interface declarations with the same name are merged in TypeScript.
@@ -45,6 +46,7 @@ export function buildFileSymbolIndex(ast: t.File): FileSymbolIndex {
     constObjects: new Map(),
     constArrays: new Map(),
     constLiterals: new Map(),
+    constExpressions: new Map(),
     typeAliases: new Map(),
     interfaces: new Map(),
     exportsStar: [],
@@ -180,6 +182,8 @@ function indexDeclaration(
         index.constLiterals.set(name, init);
       } else if (t.isArrowFunctionExpression(init) || t.isFunctionExpression(init)) {
         index.functions.set(name, init);
+      } else if (t.isExpression(init)) {
+        index.constExpressions.set(name, init);
       }
     }
     return;

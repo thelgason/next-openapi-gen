@@ -1,3 +1,8 @@
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+import * as t from "@babel/types";
 import { describe, expect, it } from "vitest";
 
 import { parseTypeScriptFile } from "@workspace/openapi-core/shared/parse-typescript.js";
@@ -137,6 +142,75 @@ describe("SymbolResolver", () => {
     expect(resolver.getIndex("/missing.ts")).toBeNull();
   });
 
+  it("evaluates computed constant initializers across the module graph", () => {
+    const graph = new Map<string, string>([
+      [
+        "/lib/limits.ts",
+        `
+          export const GIGABYTE = 1024 * 1024 * 1024;
+          export const MAX_FILE_BYTES = GIGABYTE * 2;
+          export const FILE_SIZE_LABEL = \`\${MAX_FILE_BYTES / GIGABYTE} GB\`;
+          export const NO_LIMIT = MAX_FILE_BYTES / 0;
+          export const NOT_A_SIZE = "x" * GIGABYTE;
+          export const ENABLED = true;
+          export const ENABLED_ALIAS = ENABLED;
+          export const NOTHING = null;
+          export const NOTHING_ALIAS = NOTHING;
+          export const WIDENED = (GIGABYTE * 2) as number;
+          export const SELF = OTHER;
+          export const OTHER = SELF;
+        `,
+      ],
+      [
+        "/app/schemas.ts",
+        `
+          import { MAX_FILE_BYTES, FILE_SIZE_LABEL } from "../lib/limits";
+          export const ALIAS = MAX_FILE_BYTES;
+        `,
+      ],
+    ]);
+    const access = {
+      existsSync: (filePath: string) => graph.has(filePath),
+      readFileSync: (filePath: string) => {
+        const content = graph.get(filePath);
+        if (!content) {
+          throw new Error(`Missing ${filePath}`);
+        }
+        return content;
+      },
+    };
+    const resolver = new SymbolResolver(access);
+
+    expect(resolver.resolveLiteral("/lib/limits.ts", "MAX_FILE_BYTES")).toBe(2147483648);
+    expect(resolver.resolveLiteral("/lib/limits.ts", "FILE_SIZE_LABEL")).toBe("2 GB");
+    expect(resolver.resolveLiteral("/lib/limits.ts", "NO_LIMIT")).toBeUndefined();
+    expect(resolver.resolveLiteral("/lib/limits.ts", "NOT_A_SIZE")).toBeUndefined();
+    expect(resolver.resolveLiteral("/lib/limits.ts", "ENABLED_ALIAS")).toBe(true);
+    expect(resolver.resolveLiteral("/lib/limits.ts", "NOTHING_ALIAS")).toBeNull();
+    expect(resolver.resolveLiteral("/lib/limits.ts", "WIDENED")).toBe(2147483648);
+    // Mutually referential constants terminate instead of recursing.
+    expect(resolver.resolveLiteral("/lib/limits.ts", "SELF")).toBeUndefined();
+    expect(resolver.resolveLiteral("/app/schemas.ts", "ALIAS")).toBe(2147483648);
+
+    const ast = resolver.parseFile("/app/schemas.ts");
+    const expression = parseExpression("`${FILE_SIZE_LABEL} / ${MAX_FILE_BYTES}`");
+    expect(ast).toBeTruthy();
+    expect(resolver.evaluateExpression("/app/schemas.ts", expression)).toBe("2 GB / 2147483648");
+    // Without a file, only self-contained expressions evaluate.
+    expect(resolver.evaluateExpression(undefined, expression)).toBeUndefined();
+    expect(resolver.evaluateExpression(undefined, parseExpression("(2 + 3) * 4"))).toBe(20);
+  });
+
+  it("resolves relative imports from a real file but never into node_modules", () => {
+    const resolver = new SymbolResolver(fs);
+    const thisFile = fileURLToPath(import.meta.url);
+
+    expect(resolver.resolveImportPath(thisFile, "./symbol-index.test.ts")).toBe(
+      path.join(path.dirname(thisFile), "symbol-index.test.ts"),
+    );
+    expect(resolver.resolveImportPath(thisFile, "@babel/types")).toBeNull();
+  });
+
   it("returns null for unreadable files and unknown symbols", () => {
     const resolver = new SymbolResolver({
       existsSync: () => {
@@ -174,6 +248,12 @@ describe("SymbolResolver", () => {
         `,
       ],
       [
+        "/pkg/values/index.ts",
+        `
+          export const LABEL = "shadowed";
+        `,
+      ],
+      [
         "/app/loop-a.ts",
         `
           export * from "./loop-b";
@@ -208,6 +288,8 @@ describe("SymbolResolver", () => {
 
     expect(resolver.resolveImportPath("/app/import.ts", "../pkg")).toBe("/pkg/index.ts");
     expect(resolver.resolveImportPath("/app/import.ts", "../pkg/values.ts")).toBe("/pkg/values.ts");
+    // A module file wins over a directory of the same name.
+    expect(resolver.resolveImportPath("/pkg/index.ts", "./values")).toBe("/pkg/values.ts");
     expect(resolver.resolveImportPath("/app/import.ts", "../pkg/missing.ts")).toBeNull();
     expect(resolver.resolveLiteral("/app/import.ts", "LABEL")).toBe("ok");
     expect(resolver.resolveConstArrayValues("/app/import.ts", "Totals")).toEqual(["a", 2]);
@@ -422,3 +504,11 @@ describe("SymbolResolver", () => {
     expect(resolver.resolveDeclaration("/app/named.ts", "Missing")).toBeNull();
   });
 });
+
+function parseExpression(source: string): t.Expression {
+  const statement = parseTypeScriptFile(`const value = ${source};`).program.body[0];
+  if (!t.isVariableDeclaration(statement) || !statement.declarations[0]?.init) {
+    throw new Error("Expected an initializer");
+  }
+  return statement.declarations[0].init;
+}
