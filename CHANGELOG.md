@@ -1,8 +1,18 @@
-# Unreleased
+## [1.8.2](https://github.com/tazo90/next-openapi-gen/compare/v1.8.1...v1.8.2) (2026-09-16)
 
-### ✨ Features
+### 🐛 Bug Fixes
 
-- apply Overlay 1.2 reusable actions, `$self`, and optional `targetFormat`
+- resolve alias-imported and computed constants in Zod check arguments ([#183](https://github.com/tazo90/next-openapi-gen/issues/183)) ([6090418](https://github.com/tazo90/next-openapi-gen/commit/6090418ab93bbde4391dfd206658c30672f8de32)) by [@thelgason](https://github.com/thelgason)
+
+## [1.8.1](https://github.com/tazo90/next-openapi-gen/compare/v1.8.0...v1.8.1) (2026-08-20)
+
+### 🐛 Bug Fixes
+
+- **release:** build workspace deps before packing tarball ([5023730](https://github.com/tazo90/next-openapi-gen/commit/5023730ab28c327ba3b8c9e173d6927abd764f1f))
+
+### ✅ Tests
+
+- raise coverage floors after splitting generator hotspots ([#181](https://github.com/tazo90/next-openapi-gen/issues/181)) ([171876a](https://github.com/tazo90/next-openapi-gen/commit/171876a805890d92d36f933ddf3c4aaa80807dc8)) by [@martijn00](https://github.com/martijn00)
 
 # [1.8.0](https://github.com/tazo90/next-openapi-gen/compare/v1.7.3...v1.8.0) (2026-08-17)
 
