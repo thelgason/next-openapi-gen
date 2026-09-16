@@ -6,6 +6,7 @@ import * as t from "@babel/types";
 import { logger } from "./logger.js";
 import { parseTypeScriptFile } from "./parse-typescript.js";
 import { buildFileSymbolIndex, type FileSymbolIndex } from "./symbol-index.js";
+import { resolveTypeScriptModule } from "./typescript-project.js";
 
 export type SymbolResolverFileAccess = Pick<typeof fs, "existsSync" | "readFileSync">;
 
@@ -31,6 +32,9 @@ export type ImportInfo = {
 };
 
 export type FileImportMap = Map<string, ImportInfo>;
+
+/** Caps identifier-to-identifier chasing so a pathological module graph cannot stall a run. */
+const MAX_EVALUATION_DEPTH = 16;
 
 /**
  * Shared cross-file symbol resolver.
@@ -86,6 +90,10 @@ export class SymbolResolver {
 
   /** Register an externally-parsed AST. Useful for virtual files (tests). */
   public primeAST(filePath: string, ast: t.File): void {
+    if (this.astCache.get(filePath) === ast) {
+      this.missingFiles.delete(filePath);
+      return;
+    }
     this.astCache.set(filePath, ast);
     this.missingFiles.delete(filePath);
     this.indexCache.delete(filePath);
@@ -152,8 +160,10 @@ export class SymbolResolver {
 
   /**
    * Resolve an import source string to an absolute file path, or `null` when the path
-   * cannot be located on disk. Only relative imports are followed (package imports
-   * are not the resolver's job). Results are memoized — including negative results.
+   * cannot be located on disk. Relative imports are probed directly; everything else
+   * goes through TypeScript module resolution, so `paths` aliases such as `@/constants`
+   * follow the project's own configuration. Results are memoized — including negative
+   * results.
    */
   public resolveImportPath(currentFilePath: string, importSource: string): string | null {
     const cacheKey = `${currentFilePath}::${importSource}`;
@@ -161,57 +171,84 @@ export class SymbolResolver {
       return this.importResolveCache.get(cacheKey) ?? null;
     }
 
-    let resolved: string | null = null;
+    let resolved: string | null;
     if (importSource.startsWith(".")) {
       const pathOps = currentFilePath.startsWith("/") ? path.posix : path;
       const currentDir = pathOps.dirname(currentFilePath);
-      const base = pathOps.resolve(currentDir, importSource);
-      const extensions = [".ts", ".tsx", ".js", ".jsx"];
-      const hasSourceExtension = extensions.some((extension) => base.endsWith(extension));
-
-      if (this.fileAccess.existsSync(base)) {
-        resolved = base;
-      } else if (!hasSourceExtension) {
-        for (const ext of extensions) {
-          const withExt = base + ext;
-          if (this.fileAccess.existsSync(withExt)) {
-            resolved = withExt;
-            break;
-          }
-        }
-        if (!resolved) {
-          for (const ext of extensions) {
-            const indexPath = pathOps.join(base, `index${ext}`);
-            if (this.fileAccess.existsSync(indexPath)) {
-              resolved = indexPath;
-              break;
-            }
-          }
-        }
-      }
+      resolved = this.resolveFileCandidate(pathOps.resolve(currentDir, importSource), pathOps);
+    } else {
+      const module = resolveTypeScriptModule(importSource, currentFilePath);
+      resolved = module && !/[\\/]node_modules[\\/]/.test(module) ? module : null;
     }
 
     this.importResolveCache.set(cacheKey, resolved);
     return resolved;
   }
 
+  private resolveFileCandidate(base: string, pathOps: typeof path.posix): string | null {
+    const extensions = [".ts", ".tsx", ".js", ".jsx"];
+    if (extensions.some((extension) => base.endsWith(extension))) {
+      return this.fileAccess.existsSync(base) ? base : null;
+    }
+
+    for (const extension of extensions) {
+      const withExtension = base + extension;
+      if (this.fileAccess.existsSync(withExtension)) return withExtension;
+    }
+    for (const extension of extensions) {
+      const indexPath = pathOps.join(base, `index${extension}`);
+      if (this.fileAccess.existsSync(indexPath)) return indexPath;
+    }
+
+    // Extensions we do not probe for, such as `./limits.mts`.
+    return this.fileAccess.existsSync(base) ? base : null;
+  }
+
   /**
    * Returns a simple literal value (string/number/boolean/null) for a `const` declarator,
-   * following imports and re-exports when the name is not declared locally.
+   * following imports and re-exports when the name is not declared locally. Arithmetic,
+   * template-literal and aliasing initializers are evaluated.
    */
   public resolveLiteral(filePath: string, name: string): ResolvedLiteral | undefined {
-    const visited = new Set<string>();
-    return this.resolveLiteralInternal(filePath, name, visited);
+    return this.resolveLiteralInternal(filePath, name, new Set(), 0);
+  }
+
+  /**
+   * Statically evaluate an expression as seen from `filePath`: literals, `as const`
+   * wrappers, arithmetic, template literals, and identifiers referring to constants
+   * anywhere in the resolvable module graph.
+   */
+  public evaluateExpression(
+    filePath: string | undefined,
+    node: t.Node,
+  ): ResolvedLiteral | undefined {
+    return this.evaluateNode(filePath, node, new Set(), 0);
   }
 
   private resolveLiteralInternal(
     filePath: string,
     name: string,
     visited: Set<string>,
+    depth: number,
   ): ResolvedLiteral | undefined {
-    if (visited.has(filePath)) return undefined;
-    visited.add(filePath);
+    const key = `${filePath}::${name}`;
+    if (depth > MAX_EVALUATION_DEPTH || visited.has(key)) return undefined;
 
+    // Guards the current path only; sibling expressions may name the same constant.
+    visited.add(key);
+    try {
+      return this.resolveDeclaredLiteral(filePath, name, visited, depth);
+    } finally {
+      visited.delete(key);
+    }
+  }
+
+  private resolveDeclaredLiteral(
+    filePath: string,
+    name: string,
+    visited: Set<string>,
+    depth: number,
+  ): ResolvedLiteral | undefined {
     const index = this.getIndex(filePath);
     if (!index) return undefined;
 
@@ -223,6 +260,12 @@ export class SymbolResolver {
       if (t.isNullLiteral(literal)) return null;
     }
 
+    const expression = index.constExpressions.get(name);
+    if (expression) {
+      const value = this.evaluateNode(filePath, expression, visited, depth + 1);
+      if (value !== undefined) return value;
+    }
+
     // Follow named imports
     const imports = this.getImports(filePath);
     const importInfo = imports?.get(name);
@@ -230,7 +273,7 @@ export class SymbolResolver {
       const resolved = this.resolveImportPath(filePath, importInfo.source);
       if (resolved) {
         const targetName = importInfo.importedName === "default" ? name : importInfo.importedName;
-        const result = this.resolveLiteralInternal(resolved, targetName, visited);
+        const result = this.resolveLiteralInternal(resolved, targetName, visited, depth + 1);
         if (result !== undefined) return result;
       }
     }
@@ -240,7 +283,12 @@ export class SymbolResolver {
     if (reExport) {
       const resolved = this.resolveImportPath(filePath, reExport.source);
       if (resolved) {
-        const result = this.resolveLiteralInternal(resolved, reExport.importedName, visited);
+        const result = this.resolveLiteralInternal(
+          resolved,
+          reExport.importedName,
+          visited,
+          depth + 1,
+        );
         if (result !== undefined) return result;
       }
     }
@@ -249,11 +297,92 @@ export class SymbolResolver {
     for (const starSrc of index.exportsStar) {
       const resolved = this.resolveImportPath(filePath, starSrc);
       if (!resolved) continue;
-      const result = this.resolveLiteralInternal(resolved, name, visited);
+      const result = this.resolveLiteralInternal(resolved, name, visited, depth + 1);
       if (result !== undefined) return result;
     }
 
     return undefined;
+  }
+
+  private evaluateNode(
+    filePath: string | undefined,
+    node: t.Node,
+    visited: Set<string>,
+    depth: number,
+  ): ResolvedLiteral | undefined {
+    if (depth > MAX_EVALUATION_DEPTH) return undefined;
+
+    if (t.isStringLiteral(node)) return node.value;
+    if (t.isNumericLiteral(node)) return node.value;
+    if (t.isBooleanLiteral(node)) return node.value;
+    if (t.isNullLiteral(node)) return null;
+
+    if (
+      t.isTSAsExpression(node) ||
+      t.isTSSatisfiesExpression(node) ||
+      t.isParenthesizedExpression(node)
+    ) {
+      return this.evaluateNode(filePath, node.expression, visited, depth + 1);
+    }
+
+    if (t.isIdentifier(node)) {
+      // Without a file there is nothing to look a name up in.
+      return filePath
+        ? this.resolveLiteralInternal(filePath, node.name, visited, depth + 1)
+        : undefined;
+    }
+
+    if (t.isBinaryExpression(node)) {
+      return this.evaluateArithmetic(filePath, node, visited, depth);
+    }
+
+    if (t.isTemplateLiteral(node)) {
+      let result = "";
+      for (const [position, quasi] of node.quasis.entries()) {
+        result += quasi.value.cooked ?? quasi.value.raw;
+        const expression = node.expressions[position];
+        if (!expression) continue;
+        const value = this.evaluateNode(filePath, expression, visited, depth + 1);
+        if (value === undefined) return undefined;
+        result += String(value);
+      }
+      return result;
+    }
+
+    return undefined;
+  }
+
+  private evaluateArithmetic(
+    filePath: string | undefined,
+    node: t.BinaryExpression,
+    visited: Set<string>,
+    depth: number,
+  ): number | undefined {
+    if (t.isPrivateName(node.left)) return undefined;
+    const left = this.evaluateNode(filePath, node.left, visited, depth + 1);
+    const right = this.evaluateNode(filePath, node.right, visited, depth + 1);
+    if (typeof left !== "number" || typeof right !== "number") return undefined;
+
+    // Widened: only four of the many binary operators produce a constant we can use.
+    const operator: string = node.operator;
+    let value: number;
+    switch (operator) {
+      case "+":
+        value = left + right;
+        break;
+      case "-":
+        value = left - right;
+        break;
+      case "*":
+        value = left * right;
+        break;
+      case "/":
+        value = left / right;
+        break;
+      default:
+        return undefined;
+    }
+    return Number.isFinite(value) ? value : undefined;
   }
 
   /**

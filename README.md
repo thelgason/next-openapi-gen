@@ -310,7 +310,7 @@ Version guidance:
 | `authPresets`                         | Override or extend the `@auth` keyword → scheme-name mapping                            |
 | `diagnostics.failOn`                  | CI gate: `"never"` (default), `"warning"`, or `"error"`                                 |
 
-During generation, the CLI prints diagnostics grouped by severity (`error`, `warning`, `info`) and also writes them to `.openapi-gen/manifest.json` in non-production runs. Common codes include `missing-query-params-type`, `multipart-missing-body-schema`, `schema-not-found`, `schema-dir-empty`, `path-param-schema-conflict`, `unknown-zod-helper`, `unknown-zod-method`, `type-resolution-fallback`, `inferred-path-params`, `inferred-query-params`, and `inferred-body`.
+During generation, the CLI prints diagnostics grouped by severity (`error`, `warning`, `info`) and also writes them to `.openapi-gen/manifest.json` in non-production runs. Common codes include `missing-query-params-type`, `multipart-missing-body-schema`, `schema-not-found`, `schema-dir-empty`, `path-param-schema-conflict`, `unknown-zod-helper`, `unknown-zod-method`, `unresolved-zod-argument`, `type-resolution-fallback`, `inferred-path-params`, `inferred-query-params`, and `inferred-body`.
 
 For a fuller setup guide, Pages Router notes, response sets, and route exclusion
 patterns, see [docs/getting-started.md](./docs/getting-started.md). For every

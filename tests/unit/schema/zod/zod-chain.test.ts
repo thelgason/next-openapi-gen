@@ -29,6 +29,10 @@ function host() {
     processZodNode() {
       return { type: "string" as const };
     },
+    reportedUnresolved: [] as string[],
+    reportUnresolvedArgument(methodName: string) {
+      this.reportedUnresolved.push(methodName);
+    },
     resolveLiteralValue() {
       return undefined;
     },
