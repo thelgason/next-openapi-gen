@@ -5,6 +5,7 @@ import * as t from "@babel/types";
 
 import { logger } from "./logger.js";
 import { parseTypeScriptFile } from "./parse-typescript.js";
+import { evaluateStaticArray } from "./static-value-evaluator.js";
 import { buildFileSymbolIndex, type FileSymbolIndex } from "./symbol-index.js";
 import { resolveTypeScriptModule } from "./typescript-project.js";
 
@@ -387,11 +388,20 @@ export class SymbolResolver {
 
   /**
    * Extract enum-like values from a TS enum declaration or an `as const` object/array.
-   * Follows imports and `export * from "..."` one hop, with negative caching.
+   * Follows imports and `export * from "..."` one hop, with negative caching. A const
+   * computed from other static data (`ITEMS.filter(...).map(...)`) is evaluated as a last resort.
    */
   public resolveEnumValues(filePath: string, name: string): (string | number)[] | null {
     const visited = new Set<string>();
-    return this.resolveEnumValuesInternal(filePath, name, visited);
+    return (
+      this.resolveEnumValuesInternal(filePath, name, visited) ??
+      this.evaluateConstArray(filePath, name)
+    );
+  }
+
+  private evaluateConstArray(filePath: string, name: string): (string | number)[] | null {
+    const values = evaluateStaticArray(this, filePath, name);
+    return values && values.length > 0 ? values : null;
   }
 
   private resolveEnumValuesInternal(
@@ -524,7 +534,7 @@ export class SymbolResolver {
   /** Return the literal string/number values of a const array declarator, following imports. */
   public resolveConstArrayValues(filePath: string, name: string): (string | number)[] | null {
     const declaration = this.resolveConstArrayDeclaration(filePath, name, new Set());
-    if (!declaration) return null;
+    if (!declaration) return this.evaluateConstArray(filePath, name);
     const values = this.readArrayValues(
       declaration.node,
       declaration.filePath,
